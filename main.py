@@ -233,37 +233,73 @@ class OptimizedTelethonForwarder:
         return False
 
     async def _process_messages_batch(self, messages: List, source: str, target: str):
-        """Process messages in batches with concurrency control"""
-        semaphore = asyncio.Semaphore(self.max_concurrent_uploads)
+        """Process messages in batches while maintaining chronological order"""
+        # Sort messages by ID to ensure chronological order (older messages have lower IDs)
+        messages.sort(key=lambda m: m.id)
         
-        async def process_with_semaphore(msg):
-            async with semaphore:
-                return await self._process_message(msg, source, target)
+        # Process messages sequentially to maintain order, but with controlled concurrency for downloads
+        download_semaphore = asyncio.Semaphore(self.max_concurrent_downloads)
         
-        # Process in batches
-        for i in range(0, len(messages), self.batch_size):
-            batch = messages[i:i + self.batch_size]
-            tasks = [process_with_semaphore(msg) for msg in batch]
-            results = await asyncio.gather(*tasks, return_exceptions=True)
+        async def download_with_semaphore(message):
+            if message.media:
+                async with download_semaphore:
+                    return await self._download_media(message)
+            return None
+        
+        # Pre-download all media files concurrently while maintaining message order
+        download_tasks = [download_with_semaphore(msg) for msg in messages]
+        downloaded_files = await asyncio.gather(*download_tasks, return_exceptions=True)
+        
+        # Now process messages sequentially to maintain order
+        success_count = 0
+        for i, message in enumerate(messages):
+            if self._is_forwarded(source, message.id):
+                success_count += 1
+                continue
+                
+            text = self._prepare_text(message)
+            success = False
             
-            success_count = sum(1 for r in results if r is True)
-            print(f"Batch {i//self.batch_size + 1}: {success_count}/{len(batch)} messages processed")
+            try:
+                if message.media:
+                    file_path = downloaded_files[i]
+                    if isinstance(file_path, Exception):
+                        print(f"Download failed for message {message.id}: {file_path}")
+                        continue
+                    if file_path:
+                        success = await self._send_media(message, text, target, file_path)
+                elif text.strip():
+                    success = await self._send_text(text, target)
+                else:
+                    success = True  # Empty message, mark as processed
+                
+                if success:
+                    self._mark_forwarded(source, message.id)
+                    success_count += 1
+                    # Small delay between messages to maintain order and avoid rate limits
+                    await asyncio.sleep(0.1)
+                    
+            except Exception as e:
+                print(f"Error processing message {message.id}: {e}")
+        
+        print(f"Processed {success_count}/{len(messages)} messages in order")
 
     async def _get_messages(self, source: str, limit: int) -> List:
-        """Get messages from source channel"""
+        """Get messages from source channel in chronological order (oldest first)"""
         try:
             entity = await self.client.get_entity(source)
             history = await self.client(GetHistoryRequest(
                 peer=entity, limit=limit, offset_date=None, offset_id=0,
                 max_id=0, min_id=0, add_offset=0, hash=0
             ))
-            return list(reversed(history.messages))  # Chronological order
+            # Telegram returns newest first, so reverse to get oldest first
+            return list(reversed(history.messages))
         except Exception as e:
             print(f"Error getting messages from {source}: {e}")
             return []
 
     async def _process_channel(self, channel_config: Dict[str, Any]):
-        """Process single channel with optimizations"""
+        """Process single channel maintaining message order"""
         source = channel_config['source']
         target = channel_config['target']
         limit = channel_config.get('limit', 20)
@@ -275,14 +311,14 @@ class OptimizedTelethonForwarder:
             print(f"No messages in {source}")
             return
 
-        # Filter out already processed messages
+        # Filter out already processed messages while maintaining order
         new_messages = [m for m in messages if not self._is_forwarded(source, m.id)]
         
         if not new_messages:
             print(f"All messages from {source} already processed")
             return
 
-        print(f"Processing {len(new_messages)}/{len(messages)} new messages from {source}")
+        print(f"Processing {len(new_messages)}/{len(messages)} new messages from {source} in chronological order")
         
         await self._process_messages_batch(new_messages, source, target)
         
@@ -299,7 +335,7 @@ class OptimizedTelethonForwarder:
             await self.client.start()
             print("Connected to Telegram")
             
-            # Process all channels concurrently
+            # Process all channels concurrently (each channel maintains its own message order)
             tasks = [self._process_channel(config) for config in self.channels]
             await asyncio.gather(*tasks)
             
