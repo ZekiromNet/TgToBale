@@ -338,7 +338,7 @@ async def main():
             {
                 'source': '@mitivpn',  # Source channel username or ID
                 'target': '5385300781',
-                'limit': 30
+                'limit': 20
             }
         ],
         'db_file': 'forwarded_messages.json'
