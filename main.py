@@ -335,7 +335,7 @@ async def main():
         'channels': [
             {
                 'source': '@mitivpn',  # Source channel username or ID
-                'target': '843665138',
+                'target': '5385300781',
                 'limit': 30
             }
         ],
