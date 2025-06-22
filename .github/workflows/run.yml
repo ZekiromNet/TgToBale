@@ -11,48 +11,84 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    
     steps:
     - name: Checkout repository
       uses: actions/checkout@v4
       with:
         token: ${{ secrets.GITHUB_TOKEN }}
-        fetch-depth: 1
+        fetch-depth: 0  # Changed from 1 to 0 for proper git operations
+        sparse-checkout: |
+          main.py
+          requirements.txt
+          forwarded_messages.json
+        sparse-checkout-cone-mode: false
     
-    - name: Set up Python
-      uses: actions/setup-python@v4
+    - name: Set up PyPy
+      uses: actions/setup-python@v5  # Updated to v5
       with:
-        python-version: '3.11'
+        python-version: 'pypy3.10'  # PyPy is significantly faster for I/O heavy tasks
+        cache: 'pip'  # Enable pip caching
     
-    - name: Install pip modules
-      run: |
-        python -m pip install --upgrade pip
-        if [ -f requirements.txt ]; then
-          pip install -r requirements.txt
-        fi
-        # Add any specific modules you need here
-        # pip install requests beautifulsoup4 pandas
+    - name: Cache dependencies
+      uses: actions/cache@v4
+      with:
+        path: ~/.cache/pip
+        key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
+        restore-keys: |
+          ${{ runner.os }}-pip-
     
-    - name: Run the script
+    - name: Install dependencies (optimized)
       run: |
-        python main.py
-      env: ${{ secrets }}
+        python -m pip install --upgrade pip setuptools wheel
+        # Use --no-deps for faster installs if dependencies are controlled
+        pip install --no-cache-dir -r requirements.txt
+        # Pre-compile imports for faster startup
+        python -c "import asyncio, aiohttp, telethon, json, os, pathlib"
+    
+    - name: Optimize Python environment
+      run: |
+        # Set Python optimizations
+        export PYTHONOPTIMIZE=2
+        export PYTHONDONTWRITEBYTECODE=1
+        export PYTHONUNBUFFERED=1
+        # Pre-warm the script
+        python -c "import main" || true
+    
+    - name: Run the script (with timeout and optimizations)
+      timeout-minutes: 8  # Prevent hanging (2min buffer from 10min schedule)
+      run: |
+        # Run with optimizations
+        PYTHONOPTIMIZE=2 PYTHONDONTWRITEBYTECODE=1 python -u main.py
+      env:
+        # Pass all secrets as environment variables
+        API_ID: ${{ secrets.API_ID }}
+        API_HASH: ${{ secrets.API_HASH }}
+        STRING_SESSION: ${{ secrets.STRING_SESSION }}
+        TOKEN: ${{ secrets.TOKEN }}
+        # Python optimizations
+        PYTHONOPTIMIZE: "2"
+        PYTHONDONTWRITEBYTECODE: "1"
+        PYTHONUNBUFFERED: "1"
       
-    - name: Configure Git
+    - name: Check for changes (fast)
+      id: changes
+      run: |
+        if git diff --quiet && git diff --staged --quiet; then
+          echo "has_changes=false" >> $GITHUB_OUTPUT
+          echo "No changes detected"
+        else
+          echo "has_changes=true" >> $GITHUB_OUTPUT
+          echo "Changes detected"
+        fi
+    
+    - name: Commit and push changes
+      if: steps.changes.outputs.has_changes == 'true'
       run: |
         git config --local user.email "action@github.com"
         git config --local user.name "GitHub Action"
-    
-    - name: Add and commit changes
-      run: |
-        git add .
-        if git diff --staged --quiet; then
-          echo "No changes to commit"
-        else
-          git commit -m "Automated update: $(date '+%Y-%m-%d %H:%M:%S')"
-        fi
-    
-    - name: Push changes
-      run: |
-        git push origin main
+        git add forwarded_messages.json
+        git commit -m "Update: $(date -u '+%Y-%m-%d %H:%M:%S UTC')" --no-verify
+        git push origin main --no-verify
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
