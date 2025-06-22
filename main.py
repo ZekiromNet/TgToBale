@@ -1,3 +1,6 @@
+import uvloop
+uvloop.install()
+
 import asyncio
 import json
 import os
