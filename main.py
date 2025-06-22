@@ -1,6 +1,3 @@
-import uvloop
-uvloop.install()
-
 import asyncio
 import json
 import os
@@ -13,320 +10,567 @@ from telethon.tl.types import (
     MessageEntityTextUrl, MessageEntityUrl
 )
 from telethon.tl.functions.messages import GetHistoryRequest
-from typing import Dict, List, Optional, Any, Set, Tuple
-from pathlib import Path
+from typing import Dict, List, Optional, Any, Tuple
 import time
+from pathlib import Path
+import hashlib
+from collections import OrderedDict
+import logging
+from dataclasses import dataclass
+
+# Use uvloop for maximum performance
+try:
+    import uvloop
+    asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
+    print("Using uvloop for enhanced performance")
+except ImportError:
+    print("uvloop not available, using default event loop")
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('forwarder.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+@dataclass
+class MediaInfo:
+    file_path: str
+    media_type: str
+    filename: str
+    mime_type: Optional[str] = None
 
 class OptimizedTelethonForwarder:
-    __slots__ = (
-        'config', 'client', 'bot_token', 'base_url', 'channels', 'db_file',
-        'forwarded_messages', 'session', 'last_api_call', 'api_delay'
-    )
-    
     def __init__(self, config: Dict[str, Any]):
         self.config = config
         self.client = TelegramClient(
             StringSession(config['session_string']),
             config['api_id'],
-            config['api_hash']
+            config['api_hash'],
+            timeout=30,
+            retry_delay=1,
+            auto_reconnect=True
         )
-        
         self.bot_token = config['bot_token']
         self.base_url = config['base_url']
         self.channels = config['channels']
         self.db_file = Path(config.get('db_file', 'forwarded_messages.json'))
+        self.downloads_dir = Path('downloads')
+        self.downloads_dir.mkdir(exist_ok=True)
         
-        # Pre-load database
-        self.forwarded_messages = self._load_database_sync()
+        # Performance optimizations
+        self.max_concurrent_downloads = config.get('max_concurrent_downloads', 5)
+        self.max_concurrent_uploads = config.get('max_concurrent_uploads', 3)
+        self.chunk_size = config.get('chunk_size', 8192)
+        self.session_timeout = aiohttp.ClientTimeout(total=120, connect=30)
         
-        # HTTP session for API calls
-        self.session = None
+        # Caching and batching
+        self.forwarded_messages = OrderedDict()
+        self.pending_saves = []
+        self.last_save_time = time.time()
+        self.save_interval = 10  # Save every 10 seconds
         
-        # Rate limiting
-        self.last_api_call = 0
-        self.api_delay = 0.02  # Reduced from 30ms to 20ms
+        # Session management
+        self.http_session: Optional[aiohttp.ClientSession] = None
+        
+        # Load database asynchronously
+        self._db_loaded = False
 
-    def _load_database_sync(self) -> Dict[str, Set[str]]:
-        """Load database synchronously with set for faster lookups"""
+    async def __aenter__(self):
+        """Async context manager entry"""
+        await self.initialize()
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """Async context manager exit"""
+        await self.cleanup()
+
+    async def initialize(self):
+        """Initialize all async components"""
+        # Initialize HTTP session with connection pooling
+        connector = aiohttp.TCPConnector(
+            limit=50,  # Total connection pool size
+            limit_per_host=10,  # Per-host connection limit
+            ttl_dns_cache=300,  # DNS cache TTL
+            use_dns_cache=True,
+            keepalive_timeout=60,
+            enable_cleanup_closed=True
+        )
+        
+        self.http_session = aiohttp.ClientSession(
+            connector=connector,
+            timeout=self.session_timeout,
+            headers={'User-Agent': 'TelethonForwarder/2.0'}
+        )
+        
+        # Load database
+        await self.load_database()
+        
+        # Connect to Telethon
+        await self.client.start()
+        logger.info("Initialized all components successfully")
+
+    async def cleanup(self):
+        """Cleanup resources"""
+        if self.http_session and not self.http_session.closed:
+            await self.http_session.close()
+        
+        await self.save_database()
+        
+        if self.client and self.client.is_connected():
+            await self.client.disconnect()
+        
+        logger.info("Cleanup completed")
+
+    async def load_database(self):
+        """Asynchronously load the database of forwarded messages"""
+        if self.db_file.exists():
+            try:
+                async with aiofiles.open(self.db_file, 'r', encoding='utf-8') as f:
+                    content = await f.read()
+                    data = json.loads(content)
+                    # Use OrderedDict for better performance
+                    self.forwarded_messages = OrderedDict(data)
+                    logger.info(f"Loaded {len(self.forwarded_messages)} channel records from database")
+            except (json.JSONDecodeError, Exception) as e:
+                logger.warning(f"Failed to load database: {e}")
+                self.forwarded_messages = OrderedDict()
+        else:
+            self.forwarded_messages = OrderedDict()
+        
+        self._db_loaded = True
+
+    async def save_database(self):
+        """Asynchronously save the database with atomic writes"""
         try:
-            if self.db_file.exists():
-                with open(self.db_file, 'r', encoding='utf-8') as f:
-                    data = json.load(f)
-                # Convert to sets for O(1) lookup
-                return {k: set(v.keys()) if isinstance(v, dict) else set(v) 
-                       for k, v in data.items()}
-        except:
-            pass
-        return {}
-
-    async def _save_database(self):
-        """Save database asynchronously - non-blocking"""
-        data = {k: {msg_id: True for msg_id in v} for k, v in self.forwarded_messages.items()}
-        try:
-            async with aiofiles.open(self.db_file, 'w', encoding='utf-8') as f:
-                await f.write(json.dumps(data, ensure_ascii=False, separators=(',', ':')))
-        except:
-            pass
-
-    def _is_forwarded(self, source: str, msg_id: str) -> bool:
-        """O(1) lookup for forwarded messages"""
-        return source in self.forwarded_messages and msg_id in self.forwarded_messages[source]
-
-    def _mark_forwarded(self, source: str, msg_id: str):
-        """Mark message as forwarded without immediate save"""
-        if source not in self.forwarded_messages:
-            self.forwarded_messages[source] = set()
-        self.forwarded_messages[source].add(msg_id)
-
-    def _extract_urls_fast(self, entities, text: str) -> str:
-        """Ultra-fast URL extraction and text preparation in one pass"""
-        if not entities or not text:
-            return text
-        
-        urls = []
-        for entity in entities:
-            if isinstance(entity, MessageEntityTextUrl):
-                urls.append(entity.url)
-            elif isinstance(entity, MessageEntityUrl):
-                start, end = entity.offset, entity.offset + entity.length
-                if 0 <= start < len(text) and start < end <= len(text):
-                    urls.append(text[start:end])
-        
-        return text + ('\n\n' + '\n'.join(dict.fromkeys(urls))) if urls else text
-
-    def _get_original_filename(self, message) -> str:
-        """Get original filename from message media"""
-        if not message.media:
-            return f"{message.id}"
+            temp_file = self.db_file.with_suffix('.tmp')
             
-        if isinstance(message.media, MessageMediaPhoto):
-            return f"{message.id}.jpg"
-        elif isinstance(message.media, MessageMediaDocument):
-            doc = message.media.document
-            # Try to get original filename from attributes
-            for attr in getattr(doc, 'attributes', []):
-                if hasattr(attr, 'file_name') and attr.file_name:
-                    # Clean the filename but keep extension
-                    name = attr.file_name.replace('/', '_').replace('\\', '_')
-                    return f"{message.id}_{name}"
+            async with aiofiles.open(temp_file, 'w', encoding='utf-8') as f:
+                await f.write(json.dumps(dict(self.forwarded_messages), ensure_ascii=False, indent=2))
             
-            # Fallback to mime type
-            mime = getattr(doc, 'mime_type', '')
-            if mime.startswith('video/'):
-                return f"{message.id}.mp4"
-            elif mime.startswith('audio/'):
-                return f"{message.id}.mp3"
-            elif mime.startswith('image/'):
-                return f"{message.id}.jpg"
-            else:
-                return f"{message.id}.bin"
-        
-        return f"{message.id}"
-
-    async def _ensure_session(self):
-        """Ensure HTTP session exists with optimized settings"""
-        if not self.session:
-            connector = aiohttp.TCPConnector(
-                limit=100,
-                limit_per_host=30,
-                keepalive_timeout=60,
-                enable_cleanup_closed=True
-            )
-            timeout = aiohttp.ClientTimeout(total=20, connect=5)
-            self.session = aiohttp.ClientSession(
-                timeout=timeout,
-                connector=connector,
-                headers={'Connection': 'keep-alive'}
-            )
-
-    async def _api_call(self, method: str, data: Dict, files: Optional[Dict] = None) -> bool:
-        """Ultra-optimized API call"""
-        await self._ensure_session()
-        
-        # Micro rate limiting
-        now = time.time()
-        if now - self.last_api_call < self.api_delay:
-            await asyncio.sleep(self.api_delay - (now - self.last_api_call))
-        self.last_api_call = time.time()
-        
-        url = f"{self.base_url}/bot{self.bot_token}/{method}"
-        
-        try:
-            if files:
-                form_data = aiohttp.FormData()
-                for k, v in data.items():
-                    form_data.add_field(k, str(v))
-                for k, (filename, file_data) in files.items():
-                    form_data.add_field(k, file_data, filename=filename)
-                
-                async with self.session.post(url, data=form_data) as resp:
-                    return resp.status == 200
-            else:
-                async with self.session.post(url, json=data) as resp:
-                    return resp.status == 200
-        except:
-            return False
-
-    def _get_media_params(self, message) -> Tuple[str, str]:
-        """Get media method and field in one call"""
-        if isinstance(message.media, MessageMediaPhoto):
-            return 'sendPhoto', 'photo'
-        elif isinstance(message.media, MessageMediaDocument):
-            mime = getattr(message.media.document, 'mime_type', '')
-            if mime.startswith('video/'):
-                return 'sendVideo', 'video'
-            elif mime.startswith('audio/'):
-                return 'sendAudio', 'audio'
-        return 'sendDocument', 'document'
-
-    async def _download_and_send_media(self, message, text: str, target: str) -> bool:
-        """Download and send media in one optimized flow"""
-        try:
-            # Get original filename
-            filename = self._get_original_filename(message)
-            
-            # Download to memory instead of disk for speed
-            file_bytes = await self.client.download_media(message, file=bytes)
-            if not file_bytes:
-                return False
-            
-            # Get upload parameters
-            method, field = self._get_media_params(message)
-            
-            # Prepare data
-            data = {'chat_id': target}
-            if text.strip():
-                data['caption'] = text.strip()
-            
-            # Send directly from memory
-            files = {field: (filename, file_bytes)}
-            return await self._api_call(method, data, files)
+            # Atomic rename
+            temp_file.replace(self.db_file)
+            self.last_save_time = time.time()
+            logger.debug("Database saved successfully")
             
         except Exception as e:
-            print(f"Media error {message.id}: {e}")
-            return False
+            logger.error(f"Failed to save database: {e}")
 
-    async def _send_text(self, text: str, target: str) -> bool:
-        """Send text message"""
-        return await self._api_call('sendMessage', {'chat_id': target, 'text': text.strip()})
+    async def periodic_save(self):
+        """Periodically save database to avoid data loss"""
+        if time.time() - self.last_save_time > self.save_interval:
+            await self.save_database()
 
-    async def _process_single_message(self, message, source: str, target: str) -> bool:
-        """Process single message with all optimizations"""
-        msg_id = str(message.id)
-        
-        if self._is_forwarded(source, msg_id):
-            return True
+    def is_message_forwarded(self, source_channel: str, message_id: int) -> bool:
+        """Check if message is already forwarded with O(1) lookup"""
+        return (source_channel in self.forwarded_messages and 
+                str(message_id) in self.forwarded_messages[source_channel])
 
-        # Prepare text with URLs in one pass
-        text = self._extract_urls_fast(message.entities, message.text or '')
-        
-        success = False
-        
-        if message.media:
-            success = await self._download_and_send_media(message, text, target)
-        elif text.strip():
-            success = await self._send_text(text, target)
-        else:
-            success = True  # Empty message
-        
-        if success:
-            self._mark_forwarded(source, msg_id)
-        
-        return success
+    def mark_message_forwarded(self, source_channel: str, message_id: int):
+        """Mark message as forwarded in memory"""
+        if source_channel not in self.forwarded_messages:
+            self.forwarded_messages[source_channel] = {}
+        self.forwarded_messages[source_channel][str(message_id)] = True
 
-    async def _get_messages_fast(self, source: str, limit: int) -> List:
-        """Get messages optimized"""
-        try:
-            entity = await self.client.get_entity(source)
-            result = await self.client(GetHistoryRequest(
-                peer=entity, limit=limit, offset_date=None, offset_id=0,
-                max_id=0, min_id=0, add_offset=0, hash=0
-            ))
-            # Return in chronological order (oldest first)
-            return list(reversed(result.messages))
-        except:
+    def extract_urls_optimized(self, entities: List, text: str) -> List[str]:
+        """Optimized URL extraction with minimal processing"""
+        if not entities or not text:
             return []
 
-    async def _process_channel_sequential(self, channel_config: Dict[str, Any]):
-        """Process channel with messages in strict chronological order"""
-        source = channel_config['source']
-        target = channel_config['target']
-        limit = channel_config.get('limit', 20)
-
-        print(f"Processing {source}")
+        urls = []
+        text_len = len(text)
         
-        messages = await self._get_messages_fast(source, limit)
-        if not messages:
-            return
+        for entity in entities:
+            if isinstance(entity, MessageEntityTextUrl):
+                if entity.url and entity.url not in urls:
+                    urls.append(entity.url)
+            elif isinstance(entity, MessageEntityUrl):
+                start, end = entity.offset, entity.offset + entity.length
+                if 0 <= start < text_len and start < end <= text_len:
+                    url = text[start:end]
+                    if url and url not in urls:
+                        urls.append(url)
 
-        # Filter new messages while maintaining order
-        new_messages = [m for m in messages if not self._is_forwarded(source, str(m.id))]
-        
-        if not new_messages:
-            print(f"All messages processed for {source}")
-            return
+        return urls
 
-        print(f"Sending {len(new_messages)} messages in order")
-        
-        # Process messages sequentially to maintain exact order
-        success_count = 0
-        for message in new_messages:
-            if await self._process_single_message(message, source, target):
-                success_count += 1
-                # Minimal delay to maintain order and avoid rate limits
-                if success_count < len(new_messages):  # No delay after last message
-                    await asyncio.sleep(0.05)  # Reduced from 0.1s
-        
-        print(f"Sent {success_count}/{len(new_messages)} messages")
+    def get_original_filename(self, message) -> Optional[str]:
+        """Extract original filename with proper handling"""
+        if not message.media or not hasattr(message.media, 'document'):
+            return None
+            
+        document = message.media.document
+        if not document or not hasattr(document, 'attributes'):
+            return None
+            
+        # Look for filename in document attributes
+        for attr in document.attributes:
+            if hasattr(attr, 'file_name') and attr.file_name:
+                # Clean filename but preserve extension
+                filename = attr.file_name.strip()
+                # Remove path separators for security
+                filename = filename.replace('/', '_').replace('\\', '_')
+                return filename
+                
+        return None
 
-    async def run(self):
-        """Main execution - ultra optimized"""
+    def generate_safe_filename(self, message, media_type: str, mime_type: str = None) -> str:
+        """Generate safe filename based on message and media type"""
+        original = self.get_original_filename(message)
+        if original:
+            return original
+            
+        # Generate based on media type and mime type
+        extensions = {
+            'photo': '.jpg',
+            'video': '.mp4',
+            'audio': '.mp3',
+            'voice': '.ogg',
+            'document': ''
+        }
+        
+        # Try to get extension from mime type
+        if mime_type:
+            import mimetypes
+            ext = mimetypes.guess_extension(mime_type)
+            if ext:
+                extensions[media_type] = ext
+        
+        base_name = f"{media_type}_{message.id}_{int(time.time())}"
+        return base_name + extensions.get(media_type, '')
+
+    async def download_media_optimized(self, message) -> Optional[MediaInfo]:
+        """Optimized media download with proper filename handling"""
+        if not message.media:
+            return None
+
         try:
-            # Parallel client start and session creation
-            await asyncio.gather(
-                self.client.start(),
-                self._ensure_session()
+            media_type = self.get_media_type(message)
+            if not media_type:
+                return None
+                
+            # Get mime type
+            mime_type = None
+            if hasattr(message.media, 'document') and message.media.document:
+                mime_type = getattr(message.media.document, 'mime_type', None)
+            
+            # Generate filename (preserving original when possible)
+            filename = self.generate_safe_filename(message, media_type, mime_type)
+            file_path = self.downloads_dir / filename
+            
+            # Use message hash for unique temporary filename during download
+            temp_name = f"temp_{hashlib.md5(str(message.id).encode()).hexdigest()[:8]}_{filename}"
+            temp_path = self.downloads_dir / temp_name
+            
+            # Download with progress tracking for large files
+            downloaded_path = await self.client.download_media(
+                message, 
+                file=str(temp_path),
+                progress_callback=lambda current, total: None  # Disable progress logging for performance
             )
             
-            # Process channels sequentially to maintain global message order
-            for config in self.channels:
-                await self._process_channel_sequential(config)
+            if downloaded_path:
+                # Rename to final filename
+                Path(downloaded_path).rename(file_path)
+                
+                return MediaInfo(
+                    file_path=str(file_path),
+                    media_type=media_type,
+                    filename=filename,
+                    mime_type=mime_type
+                )
+                
+        except Exception as e:
+            logger.error(f"Error downloading media for message {message.id}: {e}")
             
+        return None
+
+    def get_media_type(self, message) -> Optional[str]:
+        """Optimized media type detection"""
+        if not message.media:
+            return None
+
+        if isinstance(message.media, MessageMediaPhoto):
+            return 'photo'
+        elif isinstance(message.media, MessageMediaDocument):
+            doc = message.media.document
+            if not doc:
+                return 'document'
+                
+            mime_type = getattr(doc, 'mime_type', '')
+            
+            # Fast mime type checking
+            if mime_type.startswith('video/'):
+                return 'video'
+            elif mime_type.startswith('audio/'):
+                return 'audio'
+            elif mime_type.startswith('image/'):
+                return 'photo'
+            
+            # Check for voice messages
+            if hasattr(doc, 'attributes'):
+                for attr in doc.attributes:
+                    if hasattr(attr, 'voice') and attr.voice:
+                        return 'voice'
+                        
+            return 'document'
+
+        return 'document'
+
+    async def send_media_to_bot(self, media_info: MediaInfo, target_channel: str, caption: str = None) -> bool:
+        """Optimized media sending with streaming upload"""
+        try:
+            url = f"{self.base_url}/bot{self.bot_token}/send{media_info.media_type.capitalize()}"
+            
+            # Prepare form data
+            data = aiohttp.FormData()
+            data.add_field('chat_id', target_channel)
+            
+            if caption and caption.strip():
+                data.add_field('caption', caption.strip())
+            
+            # Stream file upload
+            file_path = Path(media_info.file_path)
+            async with aiofiles.open(file_path, 'rb') as f:
+                file_data = await f.read()
+                data.add_field(
+                    media_info.media_type,
+                    file_data,
+                    filename=media_info.filename,
+                    content_type=media_info.mime_type or 'application/octet-stream'
+                )
+
+            async with self.http_session.post(url, data=data) as response:
+                if response.status == 200:
+                    logger.debug(f"Successfully sent {media_info.media_type}: {media_info.filename}")
+                    return True
+                else:
+                    error_text = await response.text()
+                    logger.error(f"Failed to send {media_info.media_type}: HTTP {response.status} - {error_text}")
+                    return False
+                    
+        except Exception as e:
+            logger.error(f"Error sending media {media_info.filename}: {e}")
+            return False
         finally:
-            # Parallel cleanup
-            cleanup_tasks = [self._save_database()]
-            if self.session:
-                cleanup_tasks.append(self.session.close())
-            cleanup_tasks.append(self.client.disconnect())
+            # Cleanup file
+            try:
+                Path(media_info.file_path).unlink(missing_ok=True)
+            except Exception as e:
+                logger.warning(f"Failed to cleanup file {media_info.file_path}: {e}")
+
+    async def send_text_to_bot(self, text: str, target_channel: str) -> bool:
+        """Optimized text message sending"""
+        try:
+            url = f"{self.base_url}/bot{self.bot_token}/sendMessage"
             
-            await asyncio.gather(*cleanup_tasks, return_exceptions=True)
+            payload = {
+                'chat_id': target_channel,
+                'text': text.strip()
+            }
+
+            async with self.http_session.post(url, json=payload) as response:
+                if response.status == 200:
+                    logger.debug("Successfully sent text message")
+                    return True
+                else:
+                    error_text = await response.text()
+                    logger.error(f"Failed to send text message: HTTP {response.status} - {error_text}")
+                    return False
+                    
+        except Exception as e:
+            logger.error(f"Error sending text message: {e}")
+            return False
+
+    async def process_message(self, message, source_channel: str, target_channel: str) -> bool:
+        """Process a single message with optimized handling"""
+        if self.is_message_forwarded(source_channel, message.id):
+            return True  # Already processed
+
+        try:
+            # Get text content
+            text = message.text or getattr(message, 'message', '') or ''
+            
+            # Extract URLs efficiently
+            urls = self.extract_urls_optimized(message.entities, text)
+            if urls:
+                text += "\n\n" + "\n".join(urls)
+
+            success = False
+            
+            # Handle media messages
+            if message.media:
+                media_info = await self.download_media_optimized(message)
+                if media_info:
+                    success = await self.send_media_to_bot(media_info, target_channel, text)
+                else:
+                    logger.warning(f"Failed to download media for message {message.id}")
+                    
+            # Handle text-only messages
+            elif text.strip():
+                success = await self.send_text_to_bot(text, target_channel)
+            else:
+                # Empty message, mark as processed
+                success = True
+                logger.debug(f"Empty message {message.id}, marking as processed")
+
+            if success:
+                self.mark_message_forwarded(source_channel, message.id)
+                logger.info(f"Successfully processed message {message.id} from {source_channel}")
+                
+                # Periodic save
+                await self.periodic_save()
+                
+            return success
+            
+        except Exception as e:
+            logger.error(f"Error processing message {message.id} from {source_channel}: {e}")
+            return False
+
+    async def get_messages_batch(self, source_channel: str, limit: int = 50) -> List:
+        """Get messages in batches with error handling"""
+        try:
+            entity = await self.client.get_entity(source_channel)
+            
+            history = await self.client(GetHistoryRequest(
+                peer=entity,
+                limit=limit,
+                offset_date=None,
+                offset_id=0,
+                max_id=0,
+                min_id=0,
+                add_offset=0,
+                hash=0
+            ))
+            
+            return history.messages
+            
+        except Exception as e:
+            logger.error(f"Error getting messages from {source_channel}: {e}")
+            return []
+
+    async def process_channel_optimized(self, channel_config: Dict[str, Any]):
+        """Process channel with concurrent downloads but sequential uploads for order preservation"""
+        source_channel = channel_config['source']
+        target_channel = channel_config['target']
+        limit = channel_config.get('limit', 50)
+
+        logger.info(f"Processing channel: {source_channel} -> {target_channel}")
+
+        # Get messages
+        messages = await self.get_messages_batch(source_channel, limit)
+        if not messages:
+            logger.warning(f"No messages found in {source_channel}")
+            return
+
+        # Reverse for chronological order (oldest first)
+        messages.reverse()
+        
+        # Filter unprocessed messages
+        unprocessed_messages = [
+            msg for msg in messages 
+            if not self.is_message_forwarded(source_channel, msg.id)
+        ]
+        
+        if not unprocessed_messages:
+            logger.info(f"All messages in {source_channel} already processed")
+            return
+
+        logger.info(f"Processing {len(unprocessed_messages)} new messages from {source_channel}")
+
+        # Process messages sequentially to maintain order
+        # But use semaphores to limit concurrent operations
+        download_semaphore = asyncio.Semaphore(self.max_concurrent_downloads)
+        upload_semaphore = asyncio.Semaphore(self.max_concurrent_uploads)
+
+        async def process_with_semaphores(message):
+            async with download_semaphore:
+                async with upload_semaphore:
+                    return await self.process_message(message, source_channel, target_channel)
+
+        # Process messages in small batches to maintain order while allowing some concurrency
+        batch_size = 5
+        for i in range(0, len(unprocessed_messages), batch_size):
+            batch = unprocessed_messages[i:i + batch_size]
+            
+            # Process batch concurrently
+            tasks = [process_with_semaphores(msg) for msg in batch]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            # Log results
+            successful = sum(1 for r in results if r is True)
+            logger.info(f"Batch {i//batch_size + 1}: {successful}/{len(batch)} messages processed successfully")
+            
+            # Small delay between batches to avoid rate limiting
+            if i + batch_size < len(unprocessed_messages):
+                await asyncio.sleep(0.5)
+
+        logger.info(f"Finished processing {source_channel}")
+
+    async def run(self):
+        """Main execution method with comprehensive error handling"""
+        logger.info("Starting ultra-optimized Telethon forwarder...")
+        
+        start_time = time.time()
+        
+        try:
+            # Process all channels
+            for channel_config in self.channels:
+                try:
+                    await self.process_channel_optimized(channel_config)
+                except Exception as e:
+                    logger.error(f"Error processing channel {channel_config.get('source', 'unknown')}: {e}")
+                    continue
+
+            # Final save
+            await self.save_database()
+            
+            elapsed_time = time.time() - start_time
+            logger.info(f"Completed forwarding in {elapsed_time:.2f} seconds")
+            
+        except Exception as e:
+            logger.error(f"Critical error in main run: {e}")
+            raise
 
 async def main():
+    """Main function with proper resource management"""
     config = {
-        'api_id': int(os.environ["API_ID"]),
-        'api_hash': os.environ["API_HASH"],
-        'session_string': os.environ["STRING_SESSION"],
-        'bot_token': os.environ["TOKEN"],
+        'api_id': os.environ.get("API_ID"),
+        'api_hash': os.environ.get("API_HASH"),
+        'session_string': os.environ.get("STRING_SESSION"),
+        'bot_token': os.environ.get("TOKEN"),
         'base_url': 'https://tapi.bale.ai',
         'channels': [
             {
                 'source': '@mitivpn',
                 'target': '5385300781',
-                'limit': 20
+                'limit': 50  # Increased batch size
             }
         ],
-        'db_file': 'forwarded_messages.json'
+        'db_file': 'forwarded_messages.json',
+        # Performance tuning
+        'max_concurrent_downloads': 5,
+        'max_concurrent_uploads': 3,
+        'chunk_size': 8192
     }
 
+    # Generate session string if needed
     if not config['session_string']:
+        logger.info("No session string provided. Generating a new session...")
         client = TelegramClient(StringSession(), config['api_id'], config['api_hash'])
         await client.start()
-        print(f"Session string: {client.session.save()}")
+        session_string = client.session.save()
+        logger.info(f"Your session string: {session_string}")
+        logger.info("Please save this session string and add it to the config!")
         await client.disconnect()
         return
 
-    forwarder = OptimizedTelethonForwarder(config)
-    await forwarder.run()
+    # Run forwarder with proper resource management
+    async with OptimizedTelethonForwarder(config) as forwarder:
+        await forwarder.run()
 
 if __name__ == '__main__':
     asyncio.run(main())
