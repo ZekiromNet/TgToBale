@@ -1,0 +1,66 @@
+name: Automated Script Runner
+
+on:
+  schedule:
+    # Runs every 5 minutes
+    - cron: '*/5 * * * *'
+  workflow_dispatch: # Manual trigger
+
+jobs:
+  run-script:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        token: ${{ secrets.GITHUB_TOKEN }}
+        fetch-depth: 0
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.11'
+    
+    - name: Install pip modules
+      run: |
+        python -m pip install --upgrade pip
+        if [ -f requirements.txt ]; then
+          pip install -r requirements.txt
+        fi
+        # Add any specific modules you need here
+        # pip install requests beautifulsoup4 pandas
+    
+    - name: Run the script
+      run: |
+        python main.py
+      env: ${{ secrets }}
+    
+    - name: Remove downloads directory
+      run: |
+        if [ -d "downloads" ]; then
+          rm -rf downloads
+          echo "Downloads directory removed"
+        else
+          echo "Downloads directory not found"
+        fi
+    
+    - name: Configure Git
+      run: |
+        git config --local user.email "action@github.com"
+        git config --local user.name "GitHub Action"
+    
+    - name: Add and commit changes
+      run: |
+        git add .
+        if git diff --staged --quiet; then
+          echo "No changes to commit"
+        else
+          git commit -m "Automated update: $(date '+%Y-%m-%d %H:%M:%S')"
+        fi
+    
+    - name: Push changes
+      run: |
+        git push origin main
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
