@@ -2,8 +2,8 @@ name: Automated scrap
 
 on:
   schedule:
-    # Runs every 11 minutes
-    - cron: '*/11 * * * *'
+    # Runs every 10 minutes
+    - cron: '*/10 * * * *'
   workflow_dispatch: # Manual trigger
 
 jobs:
