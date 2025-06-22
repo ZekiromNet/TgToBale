@@ -28,7 +28,6 @@ jobs:
       uses: actions/setup-python@v5  # Updated to v5
       with:
         python-version: 'pypy3.10'  # PyPy is significantly faster for I/O heavy tasks
-        cache: 'pip'  # Enable pip caching
     
     - name: Cache dependencies
       uses: actions/cache@v4
@@ -40,8 +39,6 @@ jobs:
     
     - name: Install dependencies (optimized)
       run: |
-        python -m pip install --upgrade pip setuptools wheel
-        # Use --no-deps for faster installs if dependencies are controlled
         pip install --no-cache-dir -r requirements.txt
         # Pre-compile imports for faster startup
         python -c "import asyncio, aiohttp, telethon, json, os, pathlib"
