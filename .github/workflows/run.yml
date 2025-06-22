@@ -28,21 +28,19 @@ jobs:
         python-version: '3.11'
     
     - name: Cache dependencies
+      id: cache-deps
       uses: actions/cache@v4
       with:
-        path: |
-          ~/.cache/pip
-          ~/.local/lib/python3.11/site-packages
+        path: ~/.local/lib/python3.11/site-packages
         key: ${{ runner.os }}-python-3.11-${{ hashFiles('requirements.txt') }}
-        restore-keys: |
-          ${{ runner.os }}-python-3.11-
     
     - name: Install dependencies
-      run: pip install -r requirements.txt --no-warn-script-location --disable-pip-version-check
+      if: steps.cache-deps.outputs.cache-hit != 'true'
+      run: pip install --user -r requirements.txt --no-warn-script-location --disable-pip-version-check
     
     - name: Run script
       run: python main.py
-      timeout-minutes: 6  # Reduced timeout
+      timeout-minutes: 8  # Reduced timeout
       env:
         API_ID: ${{ secrets.API_ID }}
         API_HASH: ${{ secrets.API_HASH }}
@@ -53,7 +51,6 @@ jobs:
       
     - name: Commit changes
       run: |
-        pip freeze > requirements.txt
         if ! git diff --quiet forwarded_messages.json; then
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
