@@ -1,9 +1,9 @@
-name: Automated Script Runner
+name: Automated scrap
 
 on:
   schedule:
-    # Runs every 5 minutes
-    - cron: '*/10 * * * *'
+    # Runs every 15 minutes
+    - cron: '*/15 * * * *'
   workflow_dispatch: # Manual trigger
 
 jobs:
