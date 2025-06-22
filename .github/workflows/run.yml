@@ -53,6 +53,7 @@ jobs:
       
     - name: Commit changes
       run: |
+        pip freeze > requirements.txt
         if ! git diff --quiet forwarded_messages.json; then
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
