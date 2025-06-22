@@ -21,7 +21,7 @@ class OptimizedTelethonForwarder:
             StringSession(config['session_string']),
             config['api_id'],
             config['api_hash']
-        ).start()
+        )
         
         self.bot_token = config['bot_token']
         self.base_url = config['base_url']
@@ -295,6 +295,10 @@ class OptimizedTelethonForwarder:
         print("Starting optimized forwarder...")
         
         try:
+            # Start the client
+            await self.client.start()
+            print("Connected to Telegram")
+            
             # Process all channels concurrently
             tasks = [self._process_channel(config) for config in self.channels]
             await asyncio.gather(*tasks)
@@ -305,6 +309,7 @@ class OptimizedTelethonForwarder:
             # Cleanup
             if self.session:
                 await self.session.close()
+            await self.client.disconnect()
             await self._save_database()
 
 async def main():
