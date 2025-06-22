@@ -300,6 +300,8 @@ class TelethonForwarder:
             print(f"No messages found in {source_channel}")
             return
 
+        messages.reverse()
+
         print(f"Found {len(messages)} messages in {source_channel}")
 
         # Process messages in chronological order (newest first, as they come from Telegram)
