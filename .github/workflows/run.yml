@@ -16,7 +16,7 @@ jobs:
       uses: actions/checkout@v4
       with:
         token: ${{ secrets.GITHUB_TOKEN }}
-        fetch-depth: 0
+        fetch-depth: 1
     
     - name: Set up Python
       uses: actions/setup-python@v4
@@ -36,16 +36,7 @@ jobs:
       run: |
         python main.py
       env: ${{ secrets }}
-    
-    - name: Remove downloads directory
-      run: |
-        if [ -d "downloads" ]; then
-          rm -rf downloads
-          echo "Downloads directory removed"
-        else
-          echo "Downloads directory not found"
-        fi
-    
+      
     - name: Configure Git
       run: |
         git config --local user.email "action@github.com"
