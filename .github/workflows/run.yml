@@ -12,36 +12,48 @@ jobs:
       contents: write
     
     steps:
-    - uses: actions/checkout@v4
+    - name: Checkout code
+      uses: actions/checkout@v4
       with:
         sparse-checkout: |
           main.py
           requirements.txt
           forwarded_messages.json
         sparse-checkout-cone-mode: false
+        fetch-depth: 1  # Only fetch latest commit
     
-    - uses: actions/setup-python@v5
+    - name: Setup Python
+      uses: actions/setup-python@v5
       with:
         python-version: '3.11'
     
-    - uses: actions/cache@v4
+    - name: Cache dependencies
+      uses: actions/cache@v4
       with:
-        path: ~/.cache/pip
-        key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+        path: |
+          ~/.cache/pip
+          ~/.local/lib/python3.11/site-packages
+        key: ${{ runner.os }}-python-3.11-${{ hashFiles('requirements.txt') }}
+        restore-keys: |
+          ${{ runner.os }}-python-3.11-
     
-    - run: pip install -r requirements.txt
+    - name: Install dependencies
+      run: pip install -r requirements.txt --no-warn-script-location --disable-pip-version-check
     
-    - run: python main.py
-      timeout-minutes: 8
+    - name: Run script
+      run: python main.py
+      timeout-minutes: 6  # Reduced timeout
       env:
         API_ID: ${{ secrets.API_ID }}
         API_HASH: ${{ secrets.API_HASH }}
         STRING_SESSION: ${{ secrets.STRING_SESSION }}
         TOKEN: ${{ secrets.TOKEN }}
         PYTHONUNBUFFERED: "1"
+        PYTHONDONTWRITEBYTECODE: "1"  # Skip .pyc files
       
-    - run: |
-        if ! git diff --quiet; then
+    - name: Commit changes
+      run: |
+        if ! git diff --quiet forwarded_messages.json; then
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
           git add forwarded_messages.json
