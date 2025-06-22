@@ -327,10 +327,10 @@ class TelethonForwarder:
 async def main():
     # Configuration
     config = {
-        'api_id': os.environ.get("api_id"),  # Your API ID
-        'api_hash': os.environ.get("api_hash"),  # Your API hash
-        'session_string': os.environ.get("string_session"),  # Your string session (leave empty for first run)
-        'bot_token': os.environ.get("token"),  # Your bot token
+        'api_id': os.environ.get("API_ID"),  # Your API ID
+        'api_hash': os.environ.get("API_HASH"),  # Your API hash
+        'session_string': os.environ.get("STRING_SESSION"),  # Your string session (leave empty for first run)
+        'bot_token': os.environ.get("TOKEN"),  # Your bot token
         'base_url': 'https://tapi.bale.ai',  # Base URL for API
         'channels': [
             {
