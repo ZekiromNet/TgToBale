@@ -2,9 +2,8 @@ name: Automated scrap
 
 on:
   schedule:
-    # Runs every 10 minutes
     - cron: '*/10 * * * *'
-  workflow_dispatch: # Manual trigger
+  workflow_dispatch:
 
 jobs:
   run-script:
@@ -13,79 +12,39 @@ jobs:
       contents: write
     
     steps:
-    - name: Checkout repository
-      uses: actions/checkout@v4
+    - uses: actions/checkout@v4
       with:
-        token: ${{ secrets.GITHUB_TOKEN }}
-        fetch-depth: 0  # Changed from 1 to 0 for proper git operations
         sparse-checkout: |
           main.py
           requirements.txt
           forwarded_messages.json
         sparse-checkout-cone-mode: false
     
-    - name: Set up PyPy
-      uses: actions/setup-python@v5  # Updated to v5
+    - uses: actions/setup-python@v5
       with:
-        python-version: 'pypy3.10'  # PyPy is significantly faster for I/O heavy tasks
+        python-version: '3.11'
     
-    - name: Cache dependencies
-      uses: actions/cache@v4
+    - uses: actions/cache@v4
       with:
         path: ~/.cache/pip
-        key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') }}
-        restore-keys: |
-          ${{ runner.os }}-pip-
+        key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
     
-    - name: Install dependencies (optimized)
-      run: |
-        pip install --no-cache-dir -r requirements.txt
-        # Pre-compile imports for faster startup
-        python -c "import asyncio, aiohttp, telethon, json, os, pathlib"
+    - run: pip install -r requirements.txt
     
-    - name: Optimize Python environment
-      run: |
-        # Set Python optimizations
-        export PYTHONOPTIMIZE=2
-        export PYTHONDONTWRITEBYTECODE=1
-        export PYTHONUNBUFFERED=1
-        # Pre-warm the script
-        python -c "import main" || true
-    
-    - name: Run the script (with timeout and optimizations)
-      timeout-minutes: 8  # Prevent hanging (2min buffer from 10min schedule)
-      run: |
-        # Run with optimizations
-        PYTHONOPTIMIZE=2 PYTHONDONTWRITEBYTECODE=1 python -u main.py
+    - run: python main.py
+      timeout-minutes: 8
       env:
-        # Pass all secrets as environment variables
         API_ID: ${{ secrets.API_ID }}
         API_HASH: ${{ secrets.API_HASH }}
         STRING_SESSION: ${{ secrets.STRING_SESSION }}
         TOKEN: ${{ secrets.TOKEN }}
-        # Python optimizations
-        PYTHONOPTIMIZE: "2"
-        PYTHONDONTWRITEBYTECODE: "1"
         PYTHONUNBUFFERED: "1"
       
-    - name: Check for changes (fast)
-      id: changes
-      run: |
-        if git diff --quiet && git diff --staged --quiet; then
-          echo "has_changes=false" >> $GITHUB_OUTPUT
-          echo "No changes detected"
-        else
-          echo "has_changes=true" >> $GITHUB_OUTPUT
-          echo "Changes detected"
+    - run: |
+        if ! git diff --quiet; then
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add forwarded_messages.json
+          git commit -m "Update: $(date -u '+%Y-%m-%d %H:%M')"
+          git push
         fi
-    
-    - name: Commit and push changes
-      if: steps.changes.outputs.has_changes == 'true'
-      run: |
-        git config --local user.email "action@github.com"
-        git config --local user.name "GitHub Action"
-        git add forwarded_messages.json
-        git commit -m "Update: $(date -u '+%Y-%m-%d %H:%M:%S UTC')" --no-verify
-        git push origin main --no-verify
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
