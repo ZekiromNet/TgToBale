@@ -51,10 +51,10 @@ jobs:
       
     - name: Commit changes
       run: |
-        if ! git diff --quiet forwarded_messages.json; then
+        if git diff --quiet forwarded_messages.json; then
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
           git add forwarded_messages.json
-          git commit -m "Update: $(date -u '+%Y-%m-%d %H:%M')"
+          git commit -m "Update db"
           git push
         fi
