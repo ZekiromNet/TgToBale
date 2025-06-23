@@ -17,6 +17,7 @@ jobs:
       with:
         sparse-checkout: |
           main.py
+          config.py
           requirements.txt
           forwarded_messages.json
         sparse-checkout-cone-mode: false
