@@ -6,6 +6,7 @@ import json
 import os
 import aiohttp
 import aiofiles
+from config import config
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 from telethon.tl.types import (
@@ -313,22 +314,6 @@ class TelethonForwarder:
 
 
 async def main():
-    config = {
-        'api_id': os.environ.get("API_ID"),
-        'api_hash': os.environ.get("API_HASH"),
-        'session_string': os.environ.get("STRING_SESSION"),
-        'bot_token': os.environ.get("TOKEN"),
-        'base_url': 'https://tapi.bale.ai',
-        'channels': [
-            {
-                'source': '@mitivpn',
-                'target': '5385300781',
-                'limit': 20
-            }
-        ],
-        'db_file': 'forwarded_messages.json'
-    }
-
     if not config['session_string']:
         print("No session string provided. Generating a new session...")
         client = TelegramClient(StringSession(), config['api_id'], config['api_hash'])
