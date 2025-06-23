@@ -36,7 +36,7 @@ class TelethonForwarder:
         self.forwarded_messages = self.load_database()
         self.session = None
         # Limit concurrent operations (except uploads which are sequential)
-        self.semaphore = asyncio.Semaphore(20)
+        self.semaphore = asyncio.Semaphore(10)
 
     def load_database(self):
         """Load the database of forwarded messages"""
@@ -264,19 +264,27 @@ class TelethonForwarder:
 
         messages = await self.get_last_messages(source_channel, limit)
         if not messages:
-            print(f"No messages found in {source_channel}")
-            return
+            raise RuntimeError(f"CRITICAL: No messages found in {source_channel} - Script terminating!")
 
         # Reverse to maintain chronological order
         messages.reverse()
         print(f"Found {len(messages)} messages")
 
+        # Track if we sent anything
+        sent_count = 0
+        
         # Process messages sequentially to maintain order
         for message in messages:
-            await self.forward_message(message, source_channel, target_channel)
+            result = await self.forward_message(message, source_channel, target_channel)
+            if result:
+                sent_count += 1
             await asyncio.sleep(0.1)  # Reduced delay
 
-        print(f"Finished processing {source_channel}")
+        # Crash if nothing was sent
+        if sent_count == 0:
+            raise RuntimeError(f"CRITICAL: No messages were sent to {target_channel} from {source_channel} - All messages were either already forwarded or had no content!")
+
+        print(f"Finished processing {source_channel} - Sent {sent_count} messages")
 
     async def run(self):
         """Main run method"""
