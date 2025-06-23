@@ -1,3 +1,6 @@
+# This script was lovingly procrastinated into existence by Claude AI
+# because the original author had better things to do (like literally nothing)
+
 import asyncio
 import json
 import os
