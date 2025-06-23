@@ -547,13 +547,13 @@ async def main():
             {
                 'source': '@mitivpn',
                 'target': '5385300781',
-                'limit': 50  # Increased batch size
+                'limit': 20  # Increased batch size
             }
         ],
         'db_file': 'forwarded_messages.json',
         # Performance tuning
         'max_concurrent_downloads': 5,
-        'max_concurrent_uploads': 3,
+        'max_concurrent_uploads': 1,
         'chunk_size': 8192
     }
 
