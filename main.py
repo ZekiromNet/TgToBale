@@ -36,7 +36,7 @@ class TelethonForwarder:
         self.forwarded_messages = self.load_database()
         self.session = None
         # Limit concurrent operations (except uploads which are sequential)
-        self.semaphore = asyncio.Semaphore(10)
+        self.semaphore = asyncio.Semaphore(20)
 
     def load_database(self):
         """Load the database of forwarded messages"""
@@ -147,7 +147,7 @@ class TelethonForwarder:
                 async with aiofiles.open(file_path, 'rb') as f:
                     file_content = await f.read()
                 
-                form_data = aiohttp.FormData()
+                form_data = aiohttp.FormData(quote_fields=False)
                 for key, value in data.items():
                     form_data.add_field(key, value)
                 
@@ -157,7 +157,12 @@ class TelethonForwarder:
                            'audio' if 'Audio' in method else 'document'
                 
                 filename = os.path.basename(file_path)
-                form_data.add_field(field_name, file_content, filename=filename)
+                form_data.add_field(
+                    field_name, 
+                    file_content, 
+                    filename=filename,
+                    content_type='application/octet-stream'
+                )
                 
                 async with self.session.post(url, data=form_data) as response:
                     return response.status, await response.text()
