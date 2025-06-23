@@ -10,334 +10,330 @@ from telethon.tl.types import (
     MessageEntityTextUrl, MessageEntityUrl
 )
 from telethon.tl.functions.messages import GetHistoryRequest
-from typing import Dict, List, Optional, Any
-import time
-from pathlib import Path
-import hashlib
-from collections import OrderedDict
-import logging
-from dataclasses import dataclass
-from urllib.parse import unquote
 
-# Use uvloop for maximum performance
 try:
     import uvloop
     asyncio.set_event_loop_policy(uvloop.EventLoopPolicy())
-    print("Using uvloop for enhanced performance")
 except ImportError:
-    print("uvloop not available, using default event loop")
+    pass
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('forwarder.log'),
-        logging.StreamHandler()
-    ]
-)
-logger = logging.getLogger(__name__)
 
-@dataclass
-class MediaInfo:
-    file_path: str
-    media_type: str
-    filename: str
-    mime_type: Optional[str] = None
+class TelethonForwarder:
+    __slots__ = ('config', 'client', 'bot_token', 'base_url', 'channels', 
+                 'db_file', 'forwarded_messages', 'session', 'semaphore')
 
-class OptimizedTelethonForwarder:
-    def __init__(self, config: Dict[str, Any]):
+    def __init__(self, config):
         self.config = config
         self.client = TelegramClient(
             StringSession(config['session_string']),
             config['api_id'],
-            config['api_hash'],
-            timeout=30,
-            retry_delay=1,
-            auto_reconnect=True
+            config['api_hash']
         )
         self.bot_token = config['bot_token']
         self.base_url = config['base_url']
         self.channels = config['channels']
-        self.db_file = Path(config.get('db_file', 'forwarded_messages.json'))
-        self.downloads_dir = Path('downloads')
-        self.downloads_dir.mkdir(exist_ok=True)
+        self.db_file = config.get('db_file', 'forwarded_messages.json')
+        self.forwarded_messages = self.load_database()
+        self.session = None
+        # Limit concurrent operations (except uploads which are sequential)
+        self.semaphore = asyncio.Semaphore(10)
 
-        # Performance optimizations
-        self.max_concurrent_downloads = config.get('max_concurrent_downloads', 5)
-        self.max_concurrent_uploads = config.get('max_concurrent_uploads', 3)
-        self.session_timeout = aiohttp.ClientTimeout(total=120, connect=30)
-
-        # Caching and batching
-        self.forwarded_messages = OrderedDict()
-        self.last_save_time = time.time()
-        self.save_interval = 10  # Save every 10 seconds
-
-        # Session management
-        self.http_session: Optional[aiohttp.ClientSession] = None
-        self._db_loaded = False
-
-    async def __aenter__(self):
-        await self.initialize()
-        return self
-
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        await self.cleanup()
-
-    async def initialize(self):
-        connector = aiohttp.TCPConnector(
-            limit=50,
-            limit_per_host=10,
-            ttl_dns_cache=300,
-            use_dns_cache=True,
-            keepalive_timeout=60,
-            enable_cleanup_closed=True
-        )
-        self.http_session = aiohttp.ClientSession(
-            connector=connector,
-            timeout=self.session_timeout,
-            headers={'User-Agent': 'TelethonForwarder/2.0'}
-        )
-        await self.load_database()
-        await self.client.start()
-        logger.info("Initialized all components successfully")
-
-    async def cleanup(self):
-        if self.http_session and not self.http_session.closed:
-            await self.http_session.close()
-        await self.save_database()
-        if self.client and self.client.is_connected():
-            await self.client.disconnect()
-        logger.info("Cleanup completed")
-
-    async def load_database(self):
-        if self.db_file.exists():
+    def load_database(self):
+        """Load the database of forwarded messages"""
+        if os.path.exists(self.db_file):
             try:
-                async with aiofiles.open(self.db_file, 'r', encoding='utf-8') as f:
-                    content = await f.read()
-                    data = json.loads(content)
-                    self.forwarded_messages = OrderedDict(
-                        (channel, OrderedDict(messages)) for channel, messages in data.items()
-                    )
-                    logger.info(f"Loaded {len(self.forwarded_messages)} channel records from database")
-            except Exception as e:
-                logger.warning(f"Failed to load database: {e}")
-                self.forwarded_messages = OrderedDict()
-        else:
-            self.forwarded_messages = OrderedDict()
-        self._db_loaded = True
+                with open(self.db_file, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+            except json.JSONDecodeError:
+                return {}
+        return {}
 
     async def save_database(self):
-        try:
-            temp_file = self.db_file.with_suffix('.tmp')
-            # Convert nested OrderedDicts to regular dicts
-            serializable_data = {channel: dict(messages) for channel, messages in self.forwarded_messages.items()}
-            async with aiofiles.open(temp_file, 'w', encoding='utf-8') as f:
-                await f.write(json.dumps(serializable_data, ensure_ascii=False, indent=2))
-            temp_file.replace(self.db_file)
-            self.last_save_time = time.time()
-            logger.debug("Database saved successfully")
-        except Exception as e:
-            logger.error(f"Failed to save database: {e}")
+        """Save the database of forwarded messages asynchronously"""
+        async with aiofiles.open(self.db_file, 'w', encoding='utf-8') as f:
+            await f.write(json.dumps(self.forwarded_messages, ensure_ascii=False, indent=2))
 
-    async def periodic_save(self):
-        if time.time() - self.last_save_time > self.save_interval:
-            await self.save_database()
+    def is_message_forwarded(self, source_channel, message_id):
+        """Check if message is already forwarded"""
+        return source_channel in self.forwarded_messages and str(message_id) in self.forwarded_messages[source_channel]
 
-    def is_message_forwarded(self, source_channel: str, message_id: int) -> bool:
-        return (source_channel in self.forwarded_messages and str(message_id) in self.forwarded_messages[source_channel])
-
-    def mark_message_forwarded(self, source_channel: str, message_id: int):
+    async def mark_message_forwarded(self, source_channel, message_id):
+        """Mark message as forwarded"""
         if source_channel not in self.forwarded_messages:
-            self.forwarded_messages[source_channel] = OrderedDict()
+            self.forwarded_messages[source_channel] = {}
         self.forwarded_messages[source_channel][str(message_id)] = True
+        await self.save_database()
 
-    def extract_urls_optimized(self, entities: List, text: str) -> List[str]:
+    def convert_entities_to_plain_text(self, entities, text):
+        """Convert only URL entities to plain text, append URLs at the end"""
         if not entities or not text:
-            return []
-        urls = []
-        length = len(text)
-        for ent in entities:
-            if isinstance(ent, MessageEntityTextUrl) and ent.url:
-                if ent.url not in urls:
-                    urls.append(ent.url)
-            elif isinstance(ent, MessageEntityUrl):
-                s, e = ent.offset, ent.offset + ent.length
-                if 0 <= s < length and e <= length:
-                    url = text[s:e]
-                    if url not in urls:
-                        urls.append(url)
-        return urls
+            return text
 
-    def get_original_filename(self, message) -> Optional[str]:
-        if not message.media or not hasattr(message.media, 'document'):
-            return None
-        doc = message.media.document
-        if not doc or not hasattr(doc, 'attributes'):
-            return None
-        for attr in doc.attributes:
-            if hasattr(attr, 'file_name') and attr.file_name:
-                # Decode percent-encoding and sanitize
-                filename = unquote(attr.file_name.strip())
-                filename = filename.replace('/', '_').replace('\\', '_')
-                return filename
-        return None
+        urls_to_append = []
+        
+        for entity in entities:
+            if isinstance(entity, MessageEntityTextUrl):
+                if entity.url not in urls_to_append:
+                    urls_to_append.append(entity.url)
+            elif isinstance(entity, MessageEntityUrl):
+                start = entity.offset
+                end = entity.offset + entity.length
+                if 0 <= start < len(text) and start < end <= len(text):
+                    url = text[start:end]
+                    if url not in urls_to_append:
+                        urls_to_append.append(url)
 
-    def generate_safe_filename(self, message, media_type: str, mime_type: str = None) -> str:
-        orig = self.get_original_filename(message)
-        if orig:
-            return orig
-        ext_map = {'photo': '.jpg', 'video': '.mp4', 'audio': '.mp3', 'voice': '.ogg', 'document': ''}
-        ext = ''
-        if mime_type:
-            import mimetypes
-            guessed = mimetypes.guess_extension(mime_type) or ''
-            ext = guessed
-        base = f"{media_type}_{message.id}_{int(time.time())}"
-        return base + (ext_map.get(media_type, '') or ext)
+        result_text = text
+        if urls_to_append:
+            result_text += "\n\n" + "\n".join(urls_to_append)
 
-    async def download_media_optimized(self, message) -> Optional[MediaInfo]:
+        return result_text
+
+    async def download_media(self, message):
+        """Download media from message and return file path"""
         if not message.media:
             return None
+
+        os.makedirs('downloads', exist_ok=True)
+
         try:
-            mtype = self.get_media_type(message)
-            if not mtype:
-                return None
-            mime = getattr(message.media.document, 'mime_type', None) if hasattr(message.media, 'document') else None
-            filename = self.generate_safe_filename(message, mtype, mime)
-            final = self.downloads_dir / filename
-            temp = self.downloads_dir / f"tmp_{hashlib.md5(str(message.id).encode()).hexdigest()[:8]}_{filename}"
-            path = await self.client.download_media(message, file=str(temp), progress_callback=lambda c,t: None)
-            if path:
-                Path(path).rename(final)
-                return MediaInfo(str(final), mtype, filename, mime)
-        except Exception as e:
-            logger.error(f"Error downloading media {message.id}: {e}")
-        return None
+            filename = None
+            if hasattr(message.media, 'document') and message.media.document:
+                for attr in message.media.document.attributes:
+                    if hasattr(attr, 'file_name') and attr.file_name:
+                        filename = attr.file_name
+                        break
 
-    def get_media_type(self, message) -> Optional[str]:
+            if not filename:
+                media_type = self.get_media_type(message)
+                ext_map = {'photo': '.jpg', 'video': '.mp4', 'audio': '.mp3', 'document': ''}
+                filename = f"{media_type}_{message.id}{ext_map.get(media_type, '')}"
+
+            filename = "".join(c for c in filename if c.isalnum() or c in (' ', '.', '_', '-')).rstrip()
+            file_path = os.path.join('downloads', filename)
+
+            downloaded_path = await self.client.download_media(message, file_path)
+            return downloaded_path
+        except Exception as e:
+            print(f"Error downloading media: {e}")
+            return None
+
+    def get_media_type(self, message):
+        """Determine media type from message"""
         if not message.media:
             return None
+
         if isinstance(message.media, MessageMediaPhoto):
             return 'photo'
-        if isinstance(message.media, MessageMediaDocument):
-            doc = message.media.document
-            mt = getattr(doc, 'mime_type', '')
-            if mt.startswith('video/'):
-                return 'video'
-            if mt.startswith('audio/'):
-                return 'audio'
-            if mt.startswith('image/'):
-                return 'photo'
-            if any(hasattr(a, 'voice') and a.voice for a in doc.attributes):
-                return 'voice'
+        elif isinstance(message.media, MessageMediaDocument):
+            mime_type = message.media.document.mime_type
+            if mime_type:
+                if mime_type.startswith('video/'):
+                    return 'video'
+                elif mime_type.startswith('audio/'):
+                    return 'audio'
+                elif mime_type.startswith('image/'):
+                    return 'photo'
             return 'document'
+
         return 'document'
 
-    async def send_media_to_bot(self, media_info: MediaInfo, target_channel: str, caption: str = None) -> bool:
-        try:
-            url = f"{self.base_url}/bot{self.bot_token}/send{media_info.media_type.capitalize()}"
-            data = aiohttp.FormData()
-            data.add_field('chat_id', target_channel)
-            if caption:
-                data.add_field('caption', caption)
-            async with aiofiles.open(media_info.file_path, 'rb') as f:
-                content = await f.read()
-                data.add_field(media_info.media_type, content, filename=media_info.filename, content_type=media_info.mime_type or 'application/octet-stream')
-            async with self.http_session.post(url, data=data) as r:
-                if r.status == 200:
-                    logger.debug(f"Sent {media_info.filename}")
-                    return True
-                logger.error(f"Send failed {r.status}:", await r.text())
-        except Exception as e:
-            logger.error(f"Error sending media {media_info.filename}: {e}")
-        finally:
-            try: Path(media_info.file_path).unlink(missing_ok=True)
-            except: pass
-        return False
+    async def send_to_bot_api(self, method, data, file_path=None):
+        """Send request to Bot API with persistent session"""
+        url = f"{self.base_url}/bot{self.bot_token}/{method}"
 
-    async def send_text_to_bot(self, text: str, target_channel: str) -> bool:
         try:
-            url = f"{self.base_url}/bot{self.bot_token}/sendMessage"
-            payload = {'chat_id': target_channel, 'text': text}
-            async with self.http_session.post(url, json=payload) as r:
-                return r.status == 200
-        except Exception as e:
-            logger.error(f"Error sending text: {e}")
-            return False
-
-    async def process_message(self, msg, source: str, target: str) -> bool:
-        if self.is_message_forwarded(source, msg.id): return True
-        try:
-            text = msg.text or getattr(msg, 'message', '') or ''
-            urls = self.extract_urls_optimized(msg.entities, text)
-            if urls:
-                text += '\n'.join(urls)
-            if msg.media:
-                info = await self.download_media_optimized(msg)
-                success = await self.send_media_to_bot(info, target, text) if info else False
-            elif text.strip():
-                success = await self.send_text_to_bot(text, target)
+            if file_path:
+                async with aiofiles.open(file_path, 'rb') as f:
+                    file_content = await f.read()
+                
+                form_data = aiohttp.FormData()
+                for key, value in data.items():
+                    form_data.add_field(key, value)
+                
+                # Determine field name based on method
+                field_name = 'photo' if 'Photo' in method else \
+                           'video' if 'Video' in method else \
+                           'audio' if 'Audio' in method else 'document'
+                
+                filename = os.path.basename(file_path)
+                form_data.add_field(field_name, file_content, filename=filename)
+                
+                async with self.session.post(url, data=form_data) as response:
+                    return response.status, await response.text()
             else:
-                success = True
-            if success:
-                self.mark_message_forwarded(source, msg.id)
-                await self.periodic_save()
-            return success
+                async with self.session.post(url, json=data) as response:
+                    return response.status, await response.text()
         except Exception as e:
-            logger.error(f"Error processing msg {msg.id}: {e}")
-            return False
+            print(f"API request error: {e}")
+            return 500, str(e)
 
-    async def get_messages_batch(self, source_channel: str, limit: int = 50) -> List[Any]:
+    async def forward_message(self, message, source_channel, target_channel):
+        """Forward a single message"""
+        if self.is_message_forwarded(source_channel, message.id):
+            return
+
+        async with self.semaphore:
+            try:
+                text = message.text if message.text is not None else (getattr(message, 'message', '') or '')
+                plain_text = self.convert_entities_to_plain_text(message.entities, text)
+                
+                if message.media:
+                    media_type = self.get_media_type(message)
+                    file_path = await self.download_media(message)
+
+                    if not file_path:
+                        print(f"Failed to download media for message {message.id}")
+                        return
+
+                    data = {'chat_id': target_channel}
+                    if plain_text.strip():
+                        data['caption'] = plain_text.strip()
+
+                    try:
+                        method_map = {
+                            'photo': 'sendPhoto',
+                            'video': 'sendVideo', 
+                            'audio': 'sendAudio',
+                            'document': 'sendDocument'
+                        }
+                        method = method_map.get(media_type, 'sendDocument')
+                        
+                        status, response_text = await self.send_to_bot_api(method, data, file_path)
+
+                        if status == 200:
+                            print(f"✓ Media message {message.id} forwarded")
+                            await self.mark_message_forwarded(source_channel, message.id)
+                        else:
+                            print(f"✗ Failed to forward media message {message.id}: {response_text}")
+
+                    finally:
+                        if os.path.exists(file_path):
+                            os.remove(file_path)
+
+                elif plain_text.strip():
+                    data = {
+                        'chat_id': target_channel,
+                        'text': plain_text.strip()
+                    }
+
+                    status, response_text = await self.send_to_bot_api('sendMessage', data)
+
+                    if status == 200:
+                        print(f"✓ Text message {message.id} forwarded")
+                        await self.mark_message_forwarded(source_channel, message.id)
+                    else:
+                        print(f"✗ Failed to forward text message {message.id}: {response_text}")
+                else:
+                    await self.mark_message_forwarded(source_channel, message.id)
+
+            except Exception as e:
+                print(f"Error forwarding message {message.id}: {e}")
+
+    async def get_last_messages(self, source_channel, limit=20):
+        """Get last N messages from source channel"""
         try:
-            ent = await self.client.get_entity(source_channel)
-            history = await self.client(GetHistoryRequest(peer=ent, limit=limit, offset_id=0, offset_date=None, add_offset=0, max_id=0, min_id=0, hash=0))
+            entity = await self.client.get_entity(source_channel)
+            history = await self.client(GetHistoryRequest(
+                peer=entity,
+                limit=limit,
+                offset_date=None,
+                offset_id=0,
+                max_id=0,
+                min_id=0,
+                add_offset=0,
+                hash=0
+            ))
             return history.messages
         except Exception as e:
-            logger.error(f"Error fetching history for {source_channel}: {e}")
+            print(f"Error getting messages from {source_channel}: {e}")
             return []
 
-    async def process_channel(self, cfg: Dict[str, Any]):
-        src, tgt = cfg['source'], cfg['target']
-        msgs = await self.get_messages_batch(src, cfg.get('limit',45))
-        msgs.reverse()
-        unprocessed = [m for m in msgs if not self.is_message_forwarded(src,m.id)]
-        sem_d = asyncio.Semaphore(self.max_concurrent_downloads)
-        sem_u = asyncio.Semaphore(self.max_concurrent_uploads)
-        async def worker(m):
-            async with sem_d, sem_u:
-                return await self.process_message(m, src, tgt)
-        for i in range(0,len(unprocessed),5):
-            batch = unprocessed[i:i+5]
-            results = await asyncio.gather(*(worker(m) for m in batch), return_exceptions=True)
-            logger.info(f"Batch {i//5+1} results: {results}")
-            if i+5 < len(unprocessed):
-                await asyncio.sleep(0.5)
+    async def process_channel(self, channel_config):
+        """Process a single channel configuration"""
+        source_channel = channel_config['source']
+        target_channel = channel_config['target']
+        limit = channel_config.get('limit', 20)
+
+        print(f"Processing: {source_channel} -> {target_channel}")
+
+        messages = await self.get_last_messages(source_channel, limit)
+        if not messages:
+            print(f"No messages found in {source_channel}")
+            return
+
+        # Reverse to maintain chronological order
+        messages.reverse()
+        print(f"Found {len(messages)} messages")
+
+        # Process messages sequentially to maintain order
+        for message in messages:
+            await self.forward_message(message, source_channel, target_channel)
+            await asyncio.sleep(0.1)  # Reduced delay
+
+        print(f"Finished processing {source_channel}")
 
     async def run(self):
-        for ch in self.channels:
-            await self.process_channel(ch)
-        await self.save_database()
+        """Main run method"""
+        print("Starting ultra-optimized Telethon forwarder...")
+
+        # Create optimized HTTP session
+        connector = aiohttp.TCPConnector(
+            limit=100,
+            limit_per_host=30,
+            keepalive_timeout=30,
+            enable_cleanup_closed=True
+        )
+        timeout = aiohttp.ClientTimeout(total=60, connect=10)
+        self.session = aiohttp.ClientSession(
+            connector=connector,
+            timeout=timeout
+        )
+
+        try:
+            await self.client.start()
+            print("Connected to Telethon")
+
+            # Process channels concurrently
+            tasks = [self.process_channel(config) for config in self.channels]
+            await asyncio.gather(*tasks)
+
+            print("Finished forwarding messages from all channels")
+
+        finally:
+            await self.session.close()
+
 
 async def main():
     config = {
-        'api_id': os.environ.get('API_ID'),
-        'api_hash': os.environ.get('API_HASH'),
-        'session_string': os.environ.get('STRING_SESSION'),
-        'bot_token': os.environ.get('TOKEN'),
+        'api_id': os.environ.get("API_ID"),
+        'api_hash': os.environ.get("API_HASH"),
+        'session_string': os.environ.get("STRING_SESSION"),
+        'bot_token': os.environ.get("TOKEN"),
         'base_url': 'https://tapi.bale.ai',
-        'channels': [{'source':'@mitivpn','target':'5385300781','limit':20}],
-        'db_file':'forwarded_messages.json',
-        'max_concurrent_downloads':5,
-        'max_concurrent_uploads':1
+        'channels': [
+            {
+                'source': '@mitivpn',
+                'target': '5385300781',
+                'limit': 20
+            }
+        ],
+        'db_file': 'forwarded_messages.json'
     }
+
     if not config['session_string']:
-        async with TelegramClient(StringSession(), config['api_id'], config['api_hash']) as tmp:
-            await tmp.start()
-            print("Save this STRING_SESSION=", tmp.session.save())
+        print("No session string provided. Generating a new session...")
+        client = TelegramClient(StringSession(), config['api_id'], config['api_hash'])
+        await client.start()
+        session_string = client.session.save()
+        print(f"Your session string: {session_string}")
+        print("Please save this session string and add it to the config!")
+        await client.disconnect()
         return
-    async with OptimizedTelethonForwarder(config) as fwd:
-        await fwd.run()
+
+    forwarder = TelethonForwarder(config)
+    await forwarder.run()
+
 
 if __name__ == '__main__':
     asyncio.run(main())
