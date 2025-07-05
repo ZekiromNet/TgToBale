@@ -21,7 +21,7 @@ config = {
             'limit': 20
         },
         {
-            'source': '@MamelekatDaily',
+            'source': '@ShadowProxy66',
             'target': '5385300781',
             'limit': 20
         },
