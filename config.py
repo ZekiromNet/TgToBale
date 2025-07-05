@@ -14,7 +14,17 @@ config = {
             'source': '@mitivpn',
             'target': '5385300781',
             'limit': 20
-        }
+        }, 
+        {
+            'source': '@Spotify_Porteghali',
+            'target': '5385300781',
+            'limit': 20
+        },
+        {
+            'source': '@MamelekatDaily',
+            'target': '5385300781',
+            'limit': 20
+        },
     ],
     'db_file': 'forwarded_messages.json'
 }
