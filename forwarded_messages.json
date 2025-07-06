@@ -21,7 +21,10 @@
     "5041": true,
     "5042": true,
     "5055": true,
-    "5056": true
+    "5056": true,
+    "5059": true,
+    "5060": true,
+    "5061": true
   },
   "@Spotify_Porteghali": {
     "9876": true,
@@ -115,6 +118,8 @@
     "11780": true,
     "11781": true,
     "11782": true,
-    "11783": true
+    "11783": true,
+    "11784": true,
+    "11785": true
   }
 }
