@@ -363,7 +363,8 @@
     "5680": true,
     "5681": true,
     "5682": true,
-    "5683": true
+    "5683": true,
+    "5684": true
   },
   "@Spotify_Porteghali": {
     "9876": true,
@@ -572,7 +573,8 @@
     "10083": true,
     "10084": true,
     "10085": true,
-    "10086": true
+    "10086": true,
+    "10087": true
   },
   "@MamelekatDaily": {
     "5931": true,
@@ -842,6 +844,8 @@
     "12005": true,
     "12006": true,
     "12007": true,
-    "12008": true
+    "12008": true,
+    "12009": true,
+    "12010": true
   }
 }
